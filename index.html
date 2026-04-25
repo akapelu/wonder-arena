@@ -2272,6 +2272,8 @@ window.clearRoundShields = clearRoundShields = function(){
       ws.send(JSON.stringify({type:'relay', payload}));
     }
   }
+  window.WA_sendRelay = sendRelay;
+  window.WA_getPvpSocket = function(){ return ws; }
   function stopPvpSearch(){
     dbg('stopPvpSearch');
     clearInterval(pvpTimer);
@@ -2441,13 +2443,17 @@ window.clearRoundShields = clearRoundShields = function(){
       const payload = msg.payload;
       if (payload.type === 'action' && game && game.mode === 'pvp_online') {
         const a = payload.action;
-        const mirroredCol = 2 - a.col;
-        game.enemy.action = {
-          type: game.enemy.board[mirroredCol] ? 'swap' : 'place',
-          card: a.card,
-          col: mirroredCol,
-          label: 'Rival: ' + (a.label || 'acción')
-        };
+        if (a.type === 'pass') {
+          game.enemy.action = { type:'pass', card:null, col:1, label:'Rival pasa turno' };
+        } else {
+          const mirroredCol = 2 - a.col;
+          game.enemy.action = {
+            type: game.enemy.board[mirroredCol] ? 'swap' : 'place',
+            card: a.card,
+            col: mirroredCol,
+            label: 'Rival: ' + (a.label || 'acción')
+          };
+        }
         pvpRemoteActionReady = true;
         log('Acción recibida del rival.');
         updateUI();
@@ -2633,5 +2639,120 @@ window.clearRoundShields = clearRoundShields = function(){
       IMAGES[id].front.src=sp.front; IMAGES[id].back.src=sp.back;
     }
   });
+})();
+</script>
+
+<script id="v47-pvp-turn-and-ability-fixes">
+(function(){
+  const V47_DEBUG = true;
+  function dbg(){ if(V47_DEBUG) console.log('[Wonder Arena v47]', ...arguments); }
+  function isPvp(){ return window.game && game.mode === 'pvp_online'; }
+  function alive(u){ return !!u && !u.dead && u.hp > 0; }
+  function me(side){ return game && game[side]; }
+
+  window.makePassAction = function(side){
+    return { type:'pass', card:null, col:1, label:(side === 'enemy' ? 'Rival pasa turno' : 'Pasas turno') };
+  };
+
+  function sendPvpPassIfPossible(){
+    try {
+      if (typeof window.WA_sendRelay === 'function') {
+        window.WA_sendRelay({ type:'action', action:{type:'pass', card:null, col:1, label:'Pasar turno'}, round: game.round });
+        return true;
+      }
+    } catch(e) { console.warn('[Wonder Arena v47] No se pudo enviar pass', e); }
+    return false;
+  }
+
+  const previousResolveTurn = window.resolveTurn;
+  window.resolveTurn = resolveTurn = async function(){
+    if (!game || game.over || busy) return;
+    if (isPvp()) {
+      if (!game.player.action) {
+        game.player.action = window.makePassAction('player');
+        sendPvpPassIfPossible();
+        if (typeof toast === 'function') toast('Has pasado turno. Esperando al otro jugador...');
+        if (loopTimer) { clearInterval(loopTimer); loopTimer = null; }
+        if (typeof timer !== 'undefined' && timer) timer.textContent = '...';
+        if (typeof updateUI === 'function') updateUI();
+      }
+      if (!game.enemy.action) {
+        if (typeof toast === 'function') toast('Esperando acción del otro jugador...');
+        return;
+      }
+    }
+    return previousResolveTurn.apply(this, arguments);
+  };
+
+  const previousStartCountdown = window.startCountdown;
+  window.startCountdown = startCountdown = function(){
+    if (!isPvp()) return previousStartCountdown.apply(this, arguments);
+    clearInterval(loopTimer); loopTimer = null;
+    countdown = 15;
+    if (typeof timer !== 'undefined' && timer) timer.textContent = countdown;
+    loopTimer = setInterval(() => {
+      if (!game || game.over || busy) return;
+      countdown--;
+      if (typeof timer !== 'undefined' && timer) timer.textContent = countdown;
+      if (typeof updateUI === 'function') updateUI();
+      if (countdown <= 0) {
+        clearInterval(loopTimer); loopTimer = null;
+        resolveTurn();
+      }
+    }, 1000);
+  };
+
+  function applyYoyuBuffCorrectly(u, side, col){
+    const M = me(side);
+    if (!M || !u || u.type !== 'afterBuff10' || u.abilityBlocked) return false;
+    const order = [(col + 1) % 3, (col + 2) % 3, col];
+    for (const targetCol of order) {
+      const t = M.board[targetCol];
+      if (alive(t) && t !== u) {
+        t.atk = (t.atk || 0) + 10;
+        t.maxHp = (t.maxHp || t.hp || 0) + 10;
+        t.hp = Math.min(t.maxHp, (t.hp || 0) + 10);
+        if (typeof log === 'function') log(`${u.name} mejora a ${t.name} con +10 ATK/+10 HP.`);
+        return true;
+      }
+    }
+    return false;
+  }
+
+  const previousAfterHeroHit = window.afterHeroHit;
+  window.afterHeroHit = afterHeroHit = function(u, side, col=1){
+    if (u && u.type === 'afterBuff10') {
+      const savedType = u.type;
+      u.type = 'afterBuff10_v47_pending';
+      const r = previousAfterHeroHit ? previousAfterHeroHit(u, side, col) : undefined;
+      u.type = savedType;
+      applyYoyuBuffCorrectly(u, side, col);
+      return r;
+    }
+    return previousAfterHeroHit ? previousAfterHeroHit(u, side, col) : undefined;
+  };
+
+  const previousCombat = window.combat;
+  window.combat = combat = async function(col){
+    const pBefore = game && game.player ? game.player.board[col] : null;
+    const eBefore = game && game.enemy ? game.enemy.board[col] : null;
+    const pCan = alive(pBefore) && pBefore.type === 'afterBuff10';
+    const eCan = alive(eBefore) && eBefore.type === 'afterBuff10';
+    const r = await previousCombat.apply(this, arguments);
+    if (pCan && alive(pBefore)) applyYoyuBuffCorrectly(pBefore, 'player', col);
+    if (eCan && alive(eBefore)) applyYoyuBuffCorrectly(eBefore, 'enemy', col);
+    return r;
+  };
+
+  const previousApplyAction = window.applyAction;
+  window.applyAction = applyAction = function(side, action){
+    if (action && action.type === 'pass') {
+      if (typeof log === 'function') log(`${side === 'player' ? 'Tú' : 'Rival'}: pasa turno.`);
+      return;
+    }
+    return previousApplyAction.apply(this, arguments);
+  };
+
+  dbg('Parche cargado: pass turn + temporizador PvP + Yoyu corregido.');
 })();
 </script>
