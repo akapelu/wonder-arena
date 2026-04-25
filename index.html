@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1.0,viewport-fit=cover">
-<title>Wonder Arena v39 End Modal Fix</title>
+<title>Wonder Arena</title>
 <style>
 :root {
   --panel: rgba(13,16,34,.93);
@@ -168,6 +168,10 @@ button:disabled { opacity:.35; cursor:not-allowed; transform:none; }
   .bottom{display:none!important;}
   .hud{left:50%!important;width:calc(100vw - 16px)!important;grid-template-columns:1fr!important;top:58px!important;}
 }
+
+/* v48: hide mid-game unsafe buttons */
+#deckBtn, #resetBtn { display:none !important; }
+.brand h1::after { content:""; }
 </style>
 
 </head>
@@ -176,8 +180,8 @@ button:disabled { opacity:.35; cursor:not-allowed; transform:none; }
 
 <div class="ui">
  <div class="top">
-  <div class="brand"><div class="mark">WA</div><div><h1>Wonder Arena Ice</h1><div class="sub">v43: IA + buscar jugador</div></div></div>
-  <div class="actions"><button id="deckBtn">Deck</button><button id="resetBtn">Reiniciar</button><button id="resolveBtn" class="primary">Resolver ahora</button></div>
+  <div class="brand"><div class="mark">WA</div><div><h1>Wonder Arena</h1><div class="sub">v43: IA + buscar jugador</div></div></div>
+  <div class="actions"><button id="resolveBtn" class="primary">Resolver ahora</button></div>
  </div>
 
  <div class="hud">
@@ -317,8 +321,8 @@ function renderBuilder() {
 }
 
 startBtn.onclick = () => { if (selectedTroops.length === 6) newGame(); };
-deckBtn.onclick = openBuilder;
-resetBtn.onclick = () => newGame();
+if (typeof deckBtn !== "undefined" && deckBtn) deckBtn.onclick = openBuilder;
+if (typeof resetBtn !== "undefined" && resetBtn) resetBtn.onclick = () => newGame();
 resolveBtn.onclick = () => resolveTurn();
 
 function updateUI() {
