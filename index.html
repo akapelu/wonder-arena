@@ -172,6 +172,8 @@ button:disabled { opacity:.35; cursor:not-allowed; transform:none; }
 /* v48: hide mid-game unsafe buttons */
 #deckBtn, #resetBtn { display:none !important; }
 .brand h1::after { content:""; }
+button.danger { background:linear-gradient(135deg,#ff4e63,#b8233a)!important; }
+button.danger:hover { background:linear-gradient(135deg,#ff6879,#d02d45)!important; }
 </style>
 
 </head>
@@ -180,8 +182,8 @@ button:disabled { opacity:.35; cursor:not-allowed; transform:none; }
 
 <div class="ui">
  <div class="top">
-  <div class="brand"><div class="mark">WA</div><div><h1>Wonder Arena</h1><div class="sub">v43: IA + buscar jugador</div></div></div>
-  <div class="actions"><button id="resolveBtn" class="primary">Resolver ahora</button></div>
+  <div class="brand"><div class="mark">WA</div><div><h1>Wonder Arena</h1><div class="sub">PvP online</div></div></div>
+  <div class="actions"><button id="surrenderBtn" class="danger">Rendirse</button><button id="resolveBtn" class="primary">Resolver ahora</button></div>
  </div>
 
  <div class="hud">
@@ -2439,12 +2441,24 @@ window.clearRoundShields = clearRoundShields = function(){
       return;
     }
     if (msg.type === 'opponent_left') {
-      toast('El otro jugador se ha desconectado. La partida seguirá contra IA.');
-      if (game) game.mode = 'ai_after_disconnect';
+      if (typeof window.WA_handleOpponentLeft === 'function') window.WA_handleOpponentLeft();
+      else toast('El otro jugador se ha desconectado.');
+      return;
+    }
+    if (msg.type === 'opponent_forfeit') {
+      if (typeof window.WA_forceEnd === 'function') window.WA_forceEnd(true, 'Victoria', 'El otro jugador no volvió a conectarse en 15 segundos.');
+      return;
+    }
+    if (msg.type === 'opponent_surrendered') {
+      if (typeof window.WA_forceEnd === 'function') window.WA_forceEnd(true, 'Victoria', 'El otro jugador se ha rendido.');
       return;
     }
     if (msg.type === 'relay' && msg.payload) {
       const payload = msg.payload;
+      if (payload.type === 'surrender') {
+        if (typeof window.WA_forceEnd === 'function') window.WA_forceEnd(true, 'Victoria', 'El otro jugador se ha rendido.');
+        return;
+      }
       if (payload.type === 'action' && game && game.mode === 'pvp_online') {
         const a = payload.action;
         if (a.type === 'pass') {
@@ -2543,6 +2557,61 @@ window.clearRoundShields = clearRoundShields = function(){
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', bindV44Buttons);
   else bindV44Buttons();
   setInterval(bindV44Buttons, 1000);
+})();
+</script>
+
+<script id="v49-surrender-disconnect-fixes">
+(function(){
+  let disconnectTimer = null;
+  let disconnectLeft = 15;
+  function q(id){ return document.getElementById(id); }
+  function isPvp(){ return window.game && game.mode === 'pvp_online'; }
+  window.WA_forceEnd = function(playerWon, title, text){
+    try { clearInterval(disconnectTimer); } catch(e) {}
+    disconnectTimer = null;
+    try { clearInterval(loopTimer); loopTimer = null; } catch(e) {}
+    if (window.game) { game.over = true; game.phase = title || (playerWon ? 'Victoria' : 'Derrota'); }
+    try { busy = true; } catch(e) {}
+    const modalEl = q('modal'), titleEl = q('modalTitle'), textEl = q('modalText');
+    if (titleEl) titleEl.textContent = title || (playerWon ? 'Victoria' : 'Derrota');
+    if (textEl) textEl.textContent = text || (playerWon ? 'Has ganado la partida.' : 'Has perdido la partida.');
+    if (modalEl) modalEl.classList.add('show');
+    if (typeof updateUI === 'function') updateUI();
+  };
+  window.WA_handleOpponentLeft = function(){
+    if (!isPvp() || (game && game.over)) return;
+    clearInterval(disconnectTimer);
+    disconnectLeft = 15;
+    if (typeof toast === 'function') toast('El rival se ha desconectado. Victoria en 15s si no vuelve.');
+    disconnectTimer = setInterval(() => {
+      disconnectLeft--;
+      if (!isPvp() || (game && game.over)) { clearInterval(disconnectTimer); disconnectTimer = null; return; }
+      if (typeof toast === 'function') toast('Rival desconectado. Victoria en ' + disconnectLeft + 's...');
+      if (disconnectLeft <= 0) {
+        clearInterval(disconnectTimer); disconnectTimer = null;
+        window.WA_forceEnd(true, 'Victoria', 'El otro jugador se ha desconectado y no volvió en 15 segundos.');
+      }
+    }, 1000);
+  };
+  window.WA_surrender = function(){
+    if (!window.game || game.over) return;
+    const ok = confirm('¿Seguro que quieres rendirte? Perderás la partida automáticamente.');
+    if (!ok) return;
+    try {
+      const ws = typeof window.WA_getPvpSocket === 'function' ? window.WA_getPvpSocket() : null;
+      if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type:'surrender' }));
+      else if (typeof window.WA_sendRelay === 'function') window.WA_sendRelay({ type:'surrender' });
+    } catch(e) { console.warn('[Wonder Arena] No se pudo enviar rendición:', e); }
+    window.WA_forceEnd(false, 'Derrota', 'Te has rendido.');
+  };
+  function bindSurrender(){
+    const btn = q('surrenderBtn');
+    if (!btn) return;
+    btn.onclick = function(e){ e.preventDefault(); e.stopPropagation(); window.WA_surrender(); };
+    btn.style.display = (window.game && !game.over && q('builder') && q('builder').classList.contains('hidden')) ? '' : 'none';
+  }
+  setInterval(bindSurrender, 500);
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', bindSurrender); else bindSurrender();
 })();
 </script>
 
