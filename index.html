@@ -2829,3 +2829,343 @@ window.clearRoundShields = clearRoundShields = function(){
   dbg('Parche cargado: pass turn + temporizador PvP + Yoyu corregido.');
 })();
 </script>
+
+<script id="v50-final-event-pipeline">
+(function(){
+  const DEBUG = true;
+  const LOG_PREFIX = '[Wonder Arena v50 pipeline]';
+  function dbg(){ if (DEBUG) console.log(LOG_PREFIX, ...arguments); }
+  function sideObj(side){ return game && game[side]; }
+  function oppSide(side){ return side === 'player' ? 'enemy' : 'player'; }
+  function oppObj(side){ return sideObj(oppSide(side)); }
+  function alive(u){ return !!u && !u.dead && u.hp > 0; }
+  function troopAlive(u){ return alive(u) && u.kind !== 'hero'; }
+  function blocked(u){ return !!(u && u.abilityBlocked); }
+  function unitAtk(u){ return Math.max(0, (u?.atk || 0) + (u?.tempAtk || 0)); }
+  function boardUnits(side){ const m = sideObj(side); return m ? m.board.map((u,c)=>({u,c})).filter(o=>troopAlive(o.u)) : []; }
+  function clearTimer(){ if (typeof loopTimer !== 'undefined' && loopTimer) { clearInterval(loopTimer); loopTimer = null; } }
+  function triggerKey(phase, side, col, unit){ return `${game.round}:${phase}:${side}:${col}:${unit?._uid || unit?.id || unit?.name || 'unit'}`; }
+  function markOnce(phase, side, col, unit){
+    if (!game._triggered) game._triggered = new Set();
+    const k = triggerKey(phase, side, col, unit);
+    if (game._triggered.has(k)) return false;
+    game._triggered.add(k);
+    return true;
+  }
+  function ensureUid(u){ if (u && !u._uid) u._uid = (u.id || 'u') + '_' + Math.random().toString(36).slice(2,9) + '_' + Date.now().toString(36); return u; }
+
+  const baseCloneTroop = window.cloneTroop;
+  window.cloneTroop = cloneTroop = function(t, side){
+    const u = baseCloneTroop ? baseCloneTroop(t, side) : {...t, side, maxHp:t.hp, hp:t.hp, shield:0, tempAtk:0, dead:0, alpha:1, injury:0};
+    ensureUid(u);
+    return u;
+  };
+  const baseCloneHero = window.cloneHero;
+  window.cloneHero = cloneHero = function(h, side){
+    const u = baseCloneHero ? baseCloneHero(h, side) : {...h, side, kind:'hero', maxHp:h.hp, hp:h.hp, shield:0, tempAtk:0, dead:0, alpha:1};
+    ensureUid(u);
+    return u;
+  };
+
+  window.atk = atk = function(u){
+    if (!u) return 0;
+    if (u.noCombatDamage && game && game.phase === 'combate') return 0;
+    return unitAtk(u);
+  };
+
+  function farCol(col){ return typeof farthestCol === 'function' ? farthestCol(col) : (col === 0 ? 2 : col === 2 ? 0 : 1); }
+  function hitTroop(target, amount, source, col, targetSide, kind='ability'){
+    if (!alive(target) || amount <= 0) return 0;
+    const before = target.hp;
+    const dealt = damage(target, amount, source, col, targetSide, {kind});
+    if (before > target.hp) {
+      if (!blocked(target) && target.type === 'reflect30' && source && source !== target && alive(source)) {
+        if (markOnce('reflect30', targetSide, col, target)) {
+          damage(source, 30, target, col, oppSide(targetSide), {kind:'ability'});
+          log(`${target.name} refleja 30 DMG.`);
+        }
+      }
+    }
+    return dealt;
+  }
+  function hitHero(hero, amount, heroSide, col, kind='ability'){
+    if (!hero || hero.hp <= 0 || amount <= 0) return;
+    damageHero(hero, amount, heroSide, col, {kind});
+    if (kind === 'combat') hero.receivedCombatDamageThisRound = true;
+  }
+  function cleanupNow(){ if (typeof cleanup === 'function') cleanup(); if (typeof runAllExecutions === 'function') runAllExecutions(); }
+
+  window.makePassAction = function(side){ return {type:'pass', card:null, col:1, label: side === 'enemy' ? 'Rival pasa turno' : 'Pasas turno'}; };
+
+  function sendPvpPass(){
+    try { if (typeof WA_sendRelay === 'function') WA_sendRelay({type:'action', action:{type:'pass', card:null, col:1, label:'Pasar turno'}, round:game.round}); } catch(e){ console.warn(LOG_PREFIX, 'pass no enviado', e); }
+  }
+
+  const originalApplyAction = window.applyAction;
+  window.applyAction = applyAction = function(side, action){
+    if (!action || action.type === 'pass') { log(`${side === 'player' ? 'Tú' : 'Rival'}: pasa turno.`); return; }
+    const me = sideObj(side);
+    const t = me?.bench?.[action.card];
+    if (!me || !t || me.used.has(t.id)) return;
+    const incoming = cloneTroop(t, side);
+    const old = me.board[action.col];
+    if (old && old.injury >= 5) {
+      old.hp -= old.injury * 10;
+      log(`${old.name} activa Injury al moverse.`);
+    }
+    me.board[action.col] = incoming;
+    me.used.add(t.id);
+    log(`${side === 'player' ? 'Tú' : 'Rival'}: ${action.type === 'swap' ? 'intercambia' : 'baja'} ${incoming.name} en línea ${action.col + 1}.`);
+    onEnter(side, incoming, action.col);
+  };
+
+  window.onEnter = onEnter = function(side, u, col){
+    if (!alive(u) || blocked(u) || !markOnce('enter', side, col, u)) return;
+    const M = sideObj(side), O = oppObj(side), os = oppSide(side);
+    const far = farCol(col);
+    const farTarget = O.board[far];
+    const farDamage = {enterFar20:20, enterFar30:30, enterFar40:40}[u.type] || 0;
+    if (farDamage && alive(farTarget)) {
+      hitTroop(farTarget, farDamage, u, far, os, 'ability');
+      log(`${u.name} hace ${farDamage} DMG a la tropa más lejana.`);
+    }
+    if (u.type === 'enterHeroAtk20') {
+      M.hero.tempAtk = (M.hero.tempAtk || 0) + 20;
+      log(`${u.name} da +20 ATK temporal al héroe aliado.`);
+    }
+    if (u.type === 'enterHeroDamage' || u.type === 'swapHeroDamage30') {
+      hitHero(O.hero, u.type === 'enterHeroDamage' ? 40 : 30, os, col, 'ability');
+      log(`${u.name} hace daño directo al héroe enemigo.`);
+    }
+    if (M.hero.type === 'enterEnemyLaneDamage') {
+      const target = O.board[col];
+      if (alive(target)) hitTroop(target, 10, M.hero, col, os, 'ability');
+    }
+    if (M.hero.type === 'enterShieldMidRight' && (col === 1 || col === 2)) {
+      u.shield = Math.max(u.shield || 0, 10);
+    }
+    if (M.hero.type === 'abilityBlockHero' && M.board.filter(alive).length >= 3) {
+      const target = O.board[col];
+      if (alive(target)) { target.abilityBlocked = true; log(`${M.hero.name} bloquea la habilidad de ${target.name} esta ronda.`); }
+    }
+    cleanupNow();
+  };
+
+  window.startPhase = startPhase = function(side){
+    const M = sideObj(side), O = oppObj(side), os = oppSide(side);
+    if (!M || !O) return;
+    if (typeof executeLowHpTroops === 'function') executeLowHpTroops(side);
+
+    if (M.hero.type === 'charmLowAtk' && markOnce('heroStartCharm', side, -1, M.hero)) {
+      const target = O.board.find(t => alive(t) && unitAtk(t) <= 20);
+      if (target) { target.noCombatDamage = true; log(`${M.hero.name} encanta a ${target.name}: no hará daño de combate esta ronda.`); }
+    }
+    if (M.hero.type === 'conditionalHealHero' && !M.hero.receivedCombatDamageLastRound && markOnce('heroStartHeal', side, -1, M.hero)) {
+      const target = boardUnits(side).filter(o => o.u.hp < o.u.maxHp).sort((a,b)=>unitAtk(b.u)-unitAtk(a.u))[0];
+      if (target) { target.u.hp = Math.min(target.u.maxHp, target.u.hp + 10); log(`${M.hero.name} cura +10 HP a ${target.u.name}.`); }
+    }
+
+    M.board.forEach((u,col)=>{
+      if (!alive(u) || blocked(u) || !markOnce('start', side, col, u)) return;
+      if (u.type === 'startLane' || u.type === 'startLane30') {
+        const target = O.board[col];
+        if (alive(target)) { hitTroop(target, 30, u, col, os, 'ability'); log(`${u.name} hace 30 DMG a la tropa de su línea.`); }
+      }
+      if (u.type === 'startIfTwoAtk20' && M.board.filter(alive).length >= 3) {
+        u.tempAtk = (u.tempAtk || 0) + 20; log(`${u.name} gana +20 ATK esta ronda.`);
+      }
+      if (u.type === 'healOrDmg20') {
+        if (alive(O.board[col])) { M.hero.hp = Math.min(M.hero.maxHp, M.hero.hp + 20); log(`${u.name} cura +20 HP al héroe.`); }
+        else { hitHero(O.hero, 20, os, col, 'ability'); log(`${u.name} hace 20 DMG al héroe enemigo.`); }
+      }
+      if (u.type === 'startStrongest10') {
+        const target = boardUnits(os).sort((a,b)=>unitAtk(b.u)-unitAtk(a.u))[0];
+        if (target) hitTroop(target.u, 10, u, target.c, os, 'ability');
+      }
+      if (u.type === 'debuffStrongest30') {
+        const target = boardUnits(os).sort((a,b)=>unitAtk(b.u)-unitAtk(a.u))[0];
+        if (target) { target.u.tempAtk = (target.u.tempAtk || 0) - 30; target.u.debuffed = true; log(`${u.name} baja -30 ATK a ${target.u.name}.`); }
+      }
+      if (u.type === 'startHero20') hitHero(O.hero, 20, os, col, 'ability');
+    });
+    cleanupNow();
+  };
+
+  window.beforeCombat = beforeCombat = function(side){
+    const M = sideObj(side), O = oppObj(side), os = oppSide(side);
+    if (!M || !O) return;
+    M.board.forEach((u,col)=>{
+      if (!alive(u) || blocked(u) || !markOnce('beforeCombat', side, col, u)) return;
+      if (u.type === 'selfShield' || u.type === 'selfShield20' || u.type === 'selfShield30') {
+        const amount = u.type === 'selfShield30' ? 30 : 20;
+        u.shield = Math.max(u.shield || 0, amount); log(`${u.name} se protege con +${amount} escudo.`);
+      }
+      if (u.type === 'adjacentShield20' || u.type === 'adjShield20' || u.type === 'adjShield30') {
+        const amount = (u.type === 'adjacentShield30' || u.type === 'adjShield30') ? 30 : 20;
+        [col-1, col+1].forEach(c => { const ally = M.board[c]; if (alive(ally)) { ally.shield = Math.max(ally.shield || 0, amount); log(`${u.name} protege a ${ally.name} con +${amount} escudo.`); } });
+      }
+      if (u.type === 'preDamageEnemy' || u.type === 'preDmg20' || u.type === 'preDmg30') {
+        const amount = (u.type === 'preDmg20') ? 20 : 30;
+        const target = O.board[col];
+        if (alive(target)) { hitTroop(target, amount, u, col, os, 'ability'); log(`${u.name} hace ${amount} DMG antes del combate.`); }
+      }
+    });
+    cleanupNow();
+  };
+
+  function afterTroopCombat(u, side, col, target, targetWasHero=false){
+    if (!alive(u) || blocked(u) || !markOnce('afterCombat', side, col, u)) return;
+    const M = sideObj(side), O = oppObj(side), os = oppSide(side);
+
+    if (targetWasHero) {
+      if (u.type === 'heroExtra' || u.type === 'heroExtra30' || u.type === 'heroExtra20') {
+        const amount = (u.type === 'heroExtra20') ? 20 : 30;
+        hitHero(O.hero, amount, os, col, 'ability'); log(`${u.name} hace ${amount} DMG extra al héroe enemigo.`);
+      }
+      if (u.type === 'healHit20') { u.hp = Math.min(u.maxHp, u.hp + 20); log(`${u.name} se cura +20 HP.`); }
+      if (u.type === 'burnHero2') { O.hero.burn = (O.hero.burn || 0) + 2; log(`${u.name} deja 2 Burn al héroe enemigo.`); }
+      if (u.type === 'injuryAttack2') { addInjury(O.hero, 2, u, col, os); }
+    } else if (target) {
+      if (u.type === 'injuryAttack2' && alive(target)) addInjury(target, 2, u, col, os);
+      if (u.type === 'debuffPayoff30' && (target.injury || target.debuffed || target.burn)) hitTroop(target, 30, u, col, os, 'ability');
+      if ((u.type === 'killHero' || u.type === 'killHeroDamage' || u.type === 'killHero50' || u.type === 'killHero40') && !alive(target)) {
+        const amount = (u.type === 'killHero40') ? 40 : 50;
+        hitHero(O.hero, amount, os, col, 'ability'); log(`${u.name} remata y hace ${amount} DMG al héroe enemigo.`);
+      }
+    }
+
+    if (u.type === 'afterBuff10') {
+      const order = [(col + 1) % 3, (col + 2) % 3, col];
+      for (const c of order) {
+        const ally = M.board[c];
+        if (alive(ally) && ally !== u) {
+          ally.atk = (ally.atk || 0) + 10;
+          ally.maxHp = (ally.maxHp || ally.hp || 0) + 10;
+          ally.hp = Math.min(ally.maxHp, (ally.hp || 0) + 10);
+          log(`${u.name} mejora a ${ally.name} con +10 ATK/+10 HP.`);
+          break;
+        }
+      }
+    }
+  }
+  window.afterHeroHit = afterHeroHit = function(u, side, col=1){ afterTroopCombat(u, side, col, null, true); cleanupNow(); };
+
+  window.combat = combat = async function(col){
+    const p = game.player.board[col];
+    const e = game.enemy.board[col];
+    const pAlive = alive(p), eAlive = alive(e);
+
+    if (pAlive && eAlive) {
+      p.attack = 1; e.attack = 1; await wait(180);
+      const pDmg = atk(p), eDmg = atk(e);
+      if (pDmg > 0) hitTroop(e, pDmg, p, col, 'enemy', 'combat');
+      if (eDmg > 0) hitTroop(p, eDmg, e, col, 'player', 'combat');
+      log(`Línea ${col+1}: ${p.name} y ${e.name} combaten.`);
+      if (p.type === 'injuryHero' && pDmg > 0) addInjury(e, 2, p, col, 'enemy');
+      if (e.type === 'injuryHero' && eDmg > 0) addInjury(p, 2, e, col, 'player');
+      afterTroopCombat(p, 'player', col, e, false);
+      afterTroopCombat(e, 'enemy', col, p, false);
+      cleanupNow(); await wait(360); return;
+    }
+
+    if (pAlive && !eAlive) {
+      p.attack = 1; await wait(160);
+      const dmg = atk(p);
+      if (dmg > 0) hitHero(game.enemy.hero, dmg, 'enemy', col, 'combat');
+      game.player.hero.foughtEnemyHeroThisRound = true;
+      log(`${p.name} golpea al héroe rival por ${dmg}.`);
+      if (atk(game.enemy.hero) > 0) { hitTroop(p, atk(game.enemy.hero), game.enemy.hero, col, 'player', 'combat'); applyHaralkInjuryFromHero(game.enemy.hero, p, 'player', col); }
+      afterTroopCombat(p, 'player', col, null, true);
+      cleanupNow(); await wait(320); return;
+    }
+
+    if (eAlive && !pAlive) {
+      e.attack = 1; await wait(160);
+      const dmg = atk(e);
+      if (dmg > 0) hitHero(game.player.hero, dmg, 'player', col, 'combat');
+      game.enemy.hero.foughtEnemyHeroThisRound = true;
+      log(`${e.name} golpea a tu héroe por ${dmg}.`);
+      if (atk(game.player.hero) > 0) { hitTroop(e, atk(game.player.hero), game.player.hero, col, 'enemy', 'combat'); applyHaralkInjuryFromHero(game.player.hero, e, 'enemy', col); }
+      afterTroopCombat(e, 'enemy', col, null, true);
+      cleanupNow(); await wait(320); return;
+    }
+
+    log(`Línea ${col+1}: vacía.`); await wait(60);
+  };
+
+  window.endPhase = endPhase = function(side){
+    const M = sideObj(side), O = oppObj(side), os = oppSide(side);
+    if (!M || !O) return;
+    M.board.forEach((u,col)=>{
+      if (!alive(u) || blocked(u) || !markOnce('end', side, col, u)) return;
+      if (u.type === 'endHeroHeal' || u.type === 'endHeroHeal20' || u.type === 'endHeroHeal30') {
+        const amount = u.type === 'endHeroHeal20' ? 20 : 30;
+        M.hero.hp = Math.min(M.hero.maxHp, M.hero.hp + amount); log(`${u.name} cura +${amount} HP al héroe aliado.`);
+      }
+      if (u.type === 'endTroopHeal20' || u.type === 'endTroopHeal30') {
+        const amount = u.type === 'endTroopHeal30' ? 30 : 20;
+        const target = boardUnits(side).filter(o => o.u.hp < o.u.maxHp).sort((a,b)=>(a.u.hp/a.u.maxHp)-(b.u.hp/b.u.maxHp))[0];
+        if (target) { target.u.hp = Math.min(target.u.maxHp, target.u.hp + amount); log(`${u.name} cura +${amount} HP a ${target.u.name}.`); }
+      }
+      if (u.type === 'endLowest30') {
+        const target = boardUnits(os).sort((a,b)=>a.u.hp-b.u.hp)[0];
+        if (target) hitTroop(target.u, 30, u, target.c, os, 'ability');
+      }
+    });
+    if (M.hero.type === 'lowHpFinisherHero' && O.hero.hp / O.hero.maxHp <= .35 && !M.hero.foughtEnemyHeroThisRound && markOnce('heroEndFinisher', side, -1, M.hero)) {
+      hitHero(O.hero, 20, os, 1, 'ability'); log(`${M.hero.name} remata con 20 DMG.`);
+    }
+    [game.player.hero, game.enemy.hero].forEach((h,i)=>{
+      if (h.burn && h.burn > 0 && markOnce('burn', i === 0 ? 'player' : 'enemy', -1, h)) {
+        hitHero(h, h.burn * 10, i === 0 ? 'player' : 'enemy', 1, 'burn');
+        log(`${h.name} recibe ${h.burn * 10} DMG por Burn.`);
+        h.burn = 0;
+      }
+    });
+    cleanupNow();
+  };
+
+  window.clearTemporaryRoundStats = clearTemporaryRoundStats = function(){
+    if (!game) return;
+    ['player','enemy'].forEach(side=>{
+      const M = sideObj(side); if (!M) return;
+      const h = M.hero;
+      h.tempAtk = 0; h.shield = 0; h.hit = 0; h.attack = 0;
+      h.receivedCombatDamageLastRound = !!h.receivedCombatDamageThisRound;
+      h.receivedCombatDamageThisRound = false;
+      h.foughtEnemyHeroThisRound = false;
+      M.board.forEach(u=>{ if (!u) return; u.tempAtk = 0; u.shield = 0; u.hit = 0; u.attack = 0; u.noCombatDamage = false; u.abilityBlocked = false; u.debuffed = false; });
+    });
+  };
+
+  window.startCountdown = startCountdown = function(){
+    clearTimer(); countdown = 15; if (timer) timer.textContent = countdown;
+    loopTimer = setInterval(()=>{ if (!game || game.over || busy) return; countdown--; if (timer) timer.textContent = countdown; if (countdown <= 0) resolveTurn(); },1000);
+  };
+
+  window.resolveTurn = resolveTurn = async function(){
+    if (!game || game.over || busy) return;
+    if (game.mode === 'pvp_online') {
+      if (!game.player.action) { game.player.action = makePassAction('player'); sendPvpPass(); toast('Has pasado turno. Esperando al otro jugador...'); }
+      if (!game.enemy.action) { clearTimer(); if (timer) timer.textContent = '...'; updateUI(); toast('Esperando acción del otro jugador...'); return; }
+    }
+    busy = true; clearTimer(); game.phase = 'resolviendo'; if (timer) timer.textContent = '⚔'; updateUI();
+    if (game.mode !== 'pvp_online') game.enemy.action = aiChoose();
+    applyAction('player', game.player.action || makePassAction('player'));
+    applyAction('enemy', game.enemy.action || makePassAction('enemy'));
+    game.player.action = null; game.enemy.action = null; updateUI(); await wait(300);
+
+    game._triggered = new Set();
+    clearTemporaryRoundStats();
+
+    game.phase = 'inicio'; updateUI(); startPhase('player'); startPhase('enemy'); cleanupNow(); await wait(260); if (checkEnd()) return;
+    game.phase = 'antes combate'; updateUI(); beforeCombat('player'); beforeCombat('enemy'); cleanupNow(); await wait(240); if (checkEnd()) return;
+    game.phase = 'combate'; updateUI();
+    for (let col=0; col<3; col++) { await combat(col); cleanupNow(); if (checkEnd()) return; }
+    game.phase = 'fin ronda'; updateUI(); endPhase('player'); endPhase('enemy'); cleanupNow(); if (checkEnd()) return;
+    game.round++; game.phase = 'elige acción'; busy = false; updateUI(); startCountdown();
+  };
+
+  dbg('Pipeline final cargado. Triggers protegidos por fase y por unidad. Yoyu solo puede activarse una vez después de su combate.');
+})();
+</script>
